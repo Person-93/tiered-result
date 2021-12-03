@@ -6,5 +6,8 @@ edition = "2021"
 description = "A different approach to error handling"
 license = "MIT"
 
+[features]
+std = ["nullable-result/std"]
+
 [dependencies]
-nullable-result = { version = "0.7.0", features = ["try_trait"] }
+nullable-result = { version = "0.7.0", default_features = false, features = ["try_trait"] }
