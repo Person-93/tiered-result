@@ -7,3 +7,4 @@ description = "A different approach to error handling"
 license = "MIT"
 
 [dependencies]
+nullable-result = { version = "0.7.0", features = ["try_trait"] }
