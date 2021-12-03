@@ -1,5 +1,97 @@
+//! This crate is an alternate strategy for error handling for libraries.
+//!
+//! Public functions that might want to keep trying in case of error, or report
+//! multiple errors can take an additional parameter `&mut dyn ErrorHandler`. When
+//! they encounter an error that they can sort-of recover from, they can invoke the
+//! error handler (which calls back into the library user's code) and the error
+//! handler gets to decide if the function should keep going or stop early.
+//!
+//! When the error handler says to return early, this is considered a fatal error
+//! and all further processing and recovery should stop, and the library should
+//! return control to the caller as quickly as possibly.
+//!
+//! If the error handler says to continue but the error does not allow the
+//! calculation to finish, it should return null. This leads to the four variants in
+//! a [`TieredResult`]: [`Ok`], [`Err`], [`Null`], and [`Fatal`].
+//!
+//! Your library code might look something like this:
+//! ```rust
+//! use tiered_result::TieredResult;
+//! use std::fmt::{Display, Formatter};
+//! pub use tiered_result::{ErrorHandler, ClientResponse};
+//! use nullable_result::NullableResult;
+//!
+//! pub fn public_fn(handler: &mut dyn ErrorHandler<Error, Fatality>) -> Option<i64> {
+//!     match private_fn(handler) {
+//!         TieredResult::Ok(n) => Some(i64::from(n)),
+//!         TieredResult::Err(_) => Some(-1),
+//!         TieredResult::Null => None,
+//!         TieredResult::Fatal(_) => Some(-2)
+//!     }
+//! }
+//!
+//! fn private_fn(handler: &mut dyn ErrorHandler<Error, Fatality>) -> TieredResult<u32, Error, Fatality> {//!
+//!     let n = another_private_fn(handler)?; // <-- this `?` bubbles up the fatal error
+//!                                           //     leaving a nullable result behind
+//!     let n = n?; // <-- this `?` bubbles up the null/err.
+//!     // the previous two lines could be written as let n = another_private_fn(handler)??;
+//!
+//!     if n == 42 {
+//!         handler.handle_error(Error("we don't like 42".to_owned()))?;
+//!     }
+//!     TieredResult::Ok(n + 5)
+//! }
+//!
+//! fn another_private_fn(handler: &mut dyn ErrorHandler<Error, Fatality>) -> TieredResult<u32, Error, Fatality> {
+//!     // --snip--
+//!     # TieredResult::Ok(2)
+//! }
+//!
+//! // a struct to represent fatal errors, can carry additional info if you need it to
+//! struct Fatality;
+//!
+//! #[derive(Clone, Debug)]
+//! struct Error(String); // any old error type
+//!
+//! impl std::error::Error for Error {}
+//! impl Display for Error {
+//!     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+//!        write!(f, "There was an error: {}", self.0)
+//!     }
+//! }
+//! ```
+//!
+//! The calling application might look like this:
+//! ```rust
+//! # mod the_lib_from_before {
+//! #     pub use tiered_result::{ErrorHandler, ClientResponse};
+//! #     pub struct Error;
+//! #     pub struct Fatality;
+//! #     pub fn public_fn(handler: &mut dyn ErrorHandler<Error, Fatality>) -> Option<i64> {
+//! #         Some(5)
+//! #     }
+//! # }
+//! use the_lib_from_before::*;
+//!
+//! #[derive(Default)]
+//! struct Handler(u8);
+//!
+//! impl ErrorHandler<Error, Fatality> for Handler {
+//!     fn handle_error(&mut self, error: Error) -> ClientResponse<Fatality, ()> {
+//!         if self.0 > 2 { // allow two errors before giving up
+//!             ClientResponse::Throw(Fatality)
+//!         } else {
+//!             ClientResponse::Continue(())
+//!         }
+//!     }
+//! }
+//!
+//! let mut handler = Handler::default();
+//! println!("{:?}", public_fn(&mut handler));
+//! ```
 #![cfg_attr(not(feature = "std"), no_std)]
 #![feature(try_trait_v2)]
+#![warn(missing_docs)]
 
 mod try_trait;
 
@@ -7,38 +99,74 @@ use self::TieredResult::*;
 use core::{convert::Infallible, fmt::Debug, ops::Deref};
 use nullable_result::NullableResult;
 
+/// This trait should be part of your public API so that your users can implement
+/// it for their own types.
 pub trait ErrorHandler<E, F, C = ()> {
+    /// Take an error and decide if the library should continue without the result
+    /// that was supposed to have been produced.
     fn handle_error(&mut self, error: E) -> ClientResponse<F, C>;
 }
 
+/// A result type to be used internally by your library.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[must_use]
 pub enum TieredResult<T, E, F> {
+    /// Equivalent to [`Result::Ok`] or [`NullableResult::Ok`]
     Ok(T),
+
+    /// Equivalent to [`Result::Err`] or [`NullableResult::Err`]
     Err(E),
+
+    /// Equivalent to [`NullableResult::Null`]
     Null,
+
+    /// This variant will be produced by the `?` operator a a [`ClientResponse`].
+    /// It can be used to easily bubble up to your API boundary, then converted so
+    /// something your users can handle.
     Fatal(F),
 }
 
+/// A result type to be used internally by your library.
+///
+/// This can be used when one of your functions doesn't produce any errors of its
+/// own, but might need to bubble up a fatal error.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[must_use]
 pub enum FatalResult<T, F> {
+    /// See [`TieredResult::Ok`]
     Ok(T),
+
+    /// See [`TieredResult::Null`]
     Null,
+
+    /// See [`TieredResult::Fatal`]
     Fatal(F),
 }
 
+/// A result type to be used internally by your library.
+///
+/// This can be used when one of your functions doesn't do any fallible operations
+/// directly, but still needs to bubble a fatal error up from its callees.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[must_use]
 pub enum FatalOrOk<T, F> {
+    /// See [`TieredResult::Ok`]
     Ok(T),
+
+    /// See [`TieredResult::Fatal`]
     Fatal(F),
 }
 
+/// The return type of [`ErrorHandler::handle_error`]. This type (or a suitable alias)
+/// should be part of your library's public interface. Additionally you may want to
+/// provide methods or constants for your users' convenience.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[must_use]
 pub enum ClientResponse<F, C = ()> {
+    /// Stop processing
     Throw(F),
+
+    /// Try to continue
     Continue(C),
 }
 
@@ -214,18 +342,21 @@ impl<T, E, F> TieredResult<T, E, F> {
         }
     }
 
+    /// Replace a fatal error with [`NullableResult::Null`]
     #[inline]
     pub fn recover_as_null(self) -> NullableResult<T, E> {
         self.optional_nullable_result()
             .unwrap_or(NullableResult::Null)
     }
 
+    /// Replace a fatal error with the provided error
     #[inline]
     pub fn recover_as_err(self, err: E) -> NullableResult<T, E> {
         self.optional_nullable_result()
             .unwrap_or(NullableResult::Err(err))
     }
 
+    /// Replace a fatal error with the error returned by the provided function.
     #[inline]
     pub fn recover_as_err_with<Func: FnOnce() -> E>(
         self,
@@ -376,6 +507,10 @@ impl<T, U: TryFromFatal<T>> TryIntoFatal<U> for T {
 }
 
 impl<T, F> FatalOrOk<T, F> {
+    /// Return the contained item
+    ///
+    /// # Panics
+    /// Panics if the value contains a fatal error.
     #[inline]
     #[track_caller]
     pub fn unwrap(self) -> T {
