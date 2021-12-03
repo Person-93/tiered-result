@@ -1,7 +1,7 @@
 [package]
 name = "tiered-result"
 authors = ["person93 <person93.person93@gmail.com>"]
-version = "0.1.0"
+version = "0.1.1-dev"
 edition = "2021"
 description = "A different approach to error handling"
 license = "MIT"
